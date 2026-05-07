@@ -35,7 +35,7 @@
 // you are doing something other than passing on the MIDI messages to
 // a MIDI library.
 //
-typedef void (*MIDIcallback) (byte channel, byte command, byte arg1, byte arg2);
+typedef void (*MIDIcallback)(byte channel, byte command, byte arg1, byte arg2);
 
 // StepCallback
 //
@@ -45,7 +45,7 @@ typedef void (*MIDIcallback) (byte channel, byte command, byte arg1, byte arg2);
 // Please check FifteenStep.cpp for more info about setting the callback
 // that will be used.
 //
-typedef void (*StepCallback) (int current, int last);
+typedef void (*StepCallback)(int current, int last);
 
 // FifteenStepNote
 //
@@ -65,54 +65,73 @@ const FifteenStepNote DEFAULT_NOTE = {0x0, 0x0, 0x0, 0x0};
 
 class FifteenStep
 {
-  public:
-    FifteenStep();
-    FifteenStep(int memory);
-    void  begin();
-    void  begin(int tempo);
-    void  begin(int tempo, int steps);
-    void  begin(int tempo, int steps, int polyphony);
-    void  run();
-    void  pause();
-    void  start();
-    void  stop();
-    void  panic();
-    void  setTempo(int tempo);
-    void  setSteps(int steps);
-    void  increaseTempo();
-    void  decreaseTempo();
-    void  increaseShuffle();
-    void  decreaseShuffle();
-    void  setMidiHandler(MIDIcallback cb);
-    void  setStepHandler(StepCallback cb);
-    void  setNote(byte channel, byte pitch, byte velocity, byte step = -1);
-    byte  getPosition();
-    FifteenStepNote* getSequence();
-  private:
-    MIDIcallback      _midi_cb;
-    StepCallback      _step_cb;
-    FifteenStepNote*  _sequence;
-    bool              _running;
-    int               _sequence_size;
-    int               _tempo;
-    byte              _steps;
-    byte              _position;
-    unsigned long     _clock;
-    unsigned long     _sixteenth;
-    unsigned long     _shuffle;
-    unsigned long     _next_beat;
-    unsigned long     _next_clock;
-    unsigned long     _shuffleDivision();
-    int               _quantizedPosition();
-    int               _greater(int first, int second);
-    void              _init(int memory);
-    void              _heapSort();
-    void              _siftDown(int root, int bottom);
-    void              _resetSequence();
-    void              _loopPosition();
-    void              _tick();
-    void              _step();
-    void              _triggerNotes();
+public:
+  FifteenStep();
+  FifteenStep(int memory);
+  void begin();
+  void begin(float tempo);
+  void begin(float tempo, int steps);
+  void begin(float tempo, int steps, int polyphony);
+  void run();
+  void pause();
+  void start(int position = -1);
+  void stop();
+  void panic();
+  void setTempo(float tempo);
+  void setSteps(int steps);
+  void increaseTempo();
+  void decreaseTempo();
+  void increaseShuffle();
+  void setShuffle(uint8_t swing);
+  void decreaseShuffle();
+  void setMidiHandler(MIDIcallback cb);
+  void setStepHandler(StepCallback cb);
+  void setNote(byte channel, byte pitch, byte velocity, byte step = -1);
+  byte getPosition();
+  float getTempo();
+  unsigned long getShuffle();
+  unsigned long getbeatlength();
+  FifteenStepNote *getSequence();
+
+  // Hardware timer mode: call setHardwareTimerMode(true) to replace the
+  // micros()-polling path in run() with ISR-driven flag checks.
+  // hardwareClockPulse() is meant to be called from the timer ISR — it only
+  // touches volatile flags and is ISR-safe.
+  void setHardwareTimerMode(bool enabled);
+  void hardwareClockPulse();
+
+private:
+  MIDIcallback _midi_cb;
+  StepCallback _step_cb;
+  FifteenStepNote *_sequence;
+  bool _running;
+  int _sequence_size;
+  float _tempo;
+  byte _steps;
+  byte _position;
+  unsigned long _clock;
+  unsigned long _beatlength;
+  unsigned long _sixteenth;
+  unsigned long _shuffle;
+  unsigned long _next_beat;
+  unsigned long _next_clock;
+
+  // Hardware timer mode state
+  bool _hw_timer_mode;
+  volatile bool _hw_step_pending;
+  volatile bool _hw_clock_pending;
+  volatile uint8_t _hw_pulse_count; // MIDI clock pulses since last step (0–5)
+  unsigned long _shuffleDivision();
+  int _quantizedPosition();
+  int _greater(int first, int second);
+  void _init(int memory);
+  void _heapSort();
+  void _siftDown(int root, int bottom);
+  void _resetSequence();
+  void _loopPosition();
+  void _tick();
+  void _step();
+  void _triggerNotes();
 };
 
 #endif

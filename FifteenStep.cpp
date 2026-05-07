@@ -72,7 +72,7 @@ void FifteenStep::begin()
 // @param tempo in beats per minute
 // @return void
 //
-void FifteenStep::begin(int tempo)
+void FifteenStep::begin(float tempo)
 {
   begin(tempo, FS_DEFAULT_STEPS);
 }
@@ -88,7 +88,7 @@ void FifteenStep::begin(int tempo)
 // @param number of 16th note steps before looping
 // @return void
 //
-void FifteenStep::begin(int tempo, int steps)
+void FifteenStep::begin(float tempo, int steps)
 {
   setTempo(tempo);
   setSteps(steps);
@@ -110,32 +110,52 @@ void FifteenStep::begin(int tempo, int steps)
 void FifteenStep::run()
 {
 
-  if(! _running)
+  if (!_running)
     return;
 
-  // what's the time?
-  unsigned long now = millis();
-  // it's time to get ill.
+  // Hardware timer mode: the TC4 ISR (in sequencer_timer.ino) calls
+  // hardwareClockPulse() at each MIDI clock tick. That method sets the
+  // volatile flags below. We just process them here in main-loop context,
+  // which keeps all USB-MIDI operations out of ISR context.
+  if (_hw_timer_mode)
+  {
+    if (_hw_clock_pending)
+    {
+      _hw_clock_pending = false;
+      _tick();
+    }
+    if (_hw_step_pending)
+    {
+      _hw_step_pending = false;
+      _step();
+    }
+    return;
+  }
+
+  // Software polling fallback (used when hardware timer is not configured).
+  unsigned long now = micros();
 
   // send clock
-  if(now >= _next_clock) {
+  if (now >= _next_clock)
+  {
     _tick();
-    _next_clock = now + _clock;
+    // advance by fixed interval (not from now) to prevent drift accumulation
+    _next_clock += _clock;
   }
 
   // only step if it's time
-  if(now < _next_beat)
+  if (now < _next_beat)
     return;
 
   // advance and send notes
   _step();
 
-  // add shuffle offset to next beat if needed
-  if((_position % 2) == 0)
-    _next_beat = now + _sixteenth + _shuffle;
+  // add shuffle offset to next beat if needed.
+  // use += (not now +) to prevent drift accumulation across steps.
+  if ((_position % 2) == 0)
+    _next_beat += _sixteenth + _shuffle;
   else
-    _next_beat = now + _sixteenth - _shuffle;
-
+    _next_beat += _sixteenth - _shuffle;
 }
 
 // setTempo
@@ -148,39 +168,42 @@ void FifteenStep::run()
 // @access public
 // @return void
 //
-void FifteenStep::setTempo(int tempo)
+void FifteenStep::setTempo(float tempo)
 {
 
   // tempo in beats per minute
   _tempo = tempo;
 
   // don't go past the minimum tempo
-  if(_tempo < FS_MIN_TEMPO)
+  if (_tempo < FS_MIN_TEMPO)
     _tempo = FS_MIN_TEMPO;
 
   // don't go past the maximum tempo
-  if(_tempo > FS_MAX_TEMPO)
+  if (_tempo > FS_MAX_TEMPO)
     _tempo = FS_MAX_TEMPO;
+
+  // 60 / bpm / 1 beatlength note per beat
+  // gives you the microseconds value of a beatlength note
+  _beatlength = 60000000L / _tempo;
 
   // 60 seconds / bpm / 4 sixteeth notes per beat
   // gives you the value of a sixteenth note
-  _sixteenth = 60000L / _tempo / 4;
+  _sixteenth = _beatlength / 4;
 
   // midi clock messages should be sent 24 times
   // for every quarter note
-  _clock = 60000L / _tempo / 24;
+  _clock = _beatlength / 24;
 
   // grab new shuffle division
   unsigned long div = _shuffleDivision();
 
   // make sure the shuffle doesn't push the
   // note past the new sixteenth note value
-  if((_sixteenth - div) > _shuffle)
+  if ((_sixteenth - div) > _shuffle)
     return;
 
   // reset shuffle to last value
   _shuffle = _sixteenth - div;
-
 }
 
 // setSteps
@@ -200,19 +223,17 @@ void FifteenStep::setSteps(int steps)
   _steps = steps;
 
   // don't allow user to set a crazy amount of steps
-  if(_steps > FS_MAX_STEPS)
+  if (_steps > FS_MAX_STEPS)
     _steps = FS_MAX_STEPS;
 
   // loop through the sequence and clear notes past the current step
-  for(int i=0; i < _sequence_size; ++i)
+  for (int i = 0; i < _sequence_size; ++i)
   {
 
     // reset any steps that are over the current step count
-    if(_sequence[i].step >= _steps)
+    if (_sequence[i].step >= _steps)
       _sequence[i] = DEFAULT_NOTE;
-
   }
-
 }
 
 // increaseTempo
@@ -225,7 +246,7 @@ void FifteenStep::setSteps(int steps)
 //
 void FifteenStep::increaseTempo()
 {
-  setTempo(_tempo + 5);
+  setTempo(_tempo + 0.1L);
 }
 
 // decreaseTempo
@@ -239,7 +260,31 @@ void FifteenStep::increaseTempo()
 //
 void FifteenStep::decreaseTempo()
 {
-  setTempo(_tempo - 5);
+  setTempo(_tempo - 0.1L);
+}
+
+// getTempo
+//
+// returns the current _tempo value
+//
+// @access public
+// @return float
+//
+float FifteenStep::getTempo()
+{
+  return _tempo;
+}
+
+// getShuffle
+//
+// returns the current _shuffle value
+//
+// @access public
+// @return uint8_t
+//
+unsigned long FifteenStep::getShuffle()
+{
+  return _shuffle;
 }
 
 // increaseShuffle
@@ -261,9 +306,35 @@ void FifteenStep::increaseShuffle()
 
   // make sure the next value doesn't
   // push the note past the next one
-  if(_sixteenth <= _shuffle)
+  if (_sixteenth <= _shuffle)
     _shuffle = _sixteenth - div;
+}
 
+// setShuffle
+//
+// Allows user to dynamically set the shuffle
+// amount until the minimum (0) or maximum (clock*6) shuffle amount has
+// been reached.
+//
+// @access public
+// @return void
+//
+void FifteenStep::setShuffle(uint8_t swing = 0)
+{
+
+  // grab current shuffle division
+  unsigned long div = _shuffleDivision();
+  unsigned long previous = _shuffle;
+
+  // make sure we stop at zero
+  if (previous > _shuffle)
+    _shuffle = 0;
+
+  if (previous < (div * 6)) //midi clock 6 per 16th note
+  {
+    // multiply with division
+    _shuffle = (div * swing);
+  }
 }
 
 // decreaseShuffle
@@ -286,9 +357,13 @@ void FifteenStep::decreaseShuffle()
   _shuffle -= div;
 
   // make sure we stop at zero
-  if(previous > _shuffle)
+  if (previous > _shuffle)
     _shuffle = 0;
+}
 
+unsigned long FifteenStep::getbeatlength()
+{
+  return _beatlength;
 }
 
 // setMidiHandler
@@ -357,7 +432,7 @@ void FifteenStep::setNote(byte channel, byte pitch, byte velocity, byte step)
 {
 
   // don't save notes if the sequencer isn't running
-  if(! _running)
+  if (!_running)
     return;
 
   int position;
@@ -366,44 +441,46 @@ void FifteenStep::setNote(byte channel, byte pitch, byte velocity, byte step)
   // but also clears out existing matching notes
   bool added = false;
 
-  if(step == -1)
+  if (step == -1)
     position = _quantizedPosition();
   else
     position = step;
 
-  for(int i = _sequence_size - 1; i >= 0; i--)
+  for (int i = _sequence_size - 1; i >= 0; i--)
   {
 
     // used by another pitch, keep going
-    if(_sequence[i].pitch > 0 && _sequence[i].pitch != pitch)
+    if (_sequence[i].pitch > 0 && _sequence[i].pitch != pitch)
       continue;
 
     // used by another step, keep going
-    if(_sequence[i].step != position && _sequence[i].pitch != 0)
+    if (_sequence[i].step != position && _sequence[i].pitch != 0)
       continue;
 
     // used by another channel, keep going
-    if(_sequence[i].channel != channel && _sequence[i].pitch != 0)
+    if (_sequence[i].channel != channel && _sequence[i].pitch != 0)
       continue;
 
     // matches the sent step, pitch & channel
-    if(_sequence[i].pitch == pitch && _sequence[i].step == position && _sequence[i].channel == channel)
+    if (_sequence[i].pitch == pitch && _sequence[i].step == position && _sequence[i].channel == channel)
     {
 
-      if(velocity > 0 && _sequence[i].velocity > 0) {
-        _sequence[i] = DEFAULT_NOTE;
-        added = true;
-        continue;
-      } else if(velocity == 0 && _sequence[i].velocity == 0) {
+      if (velocity > 0 && _sequence[i].velocity > 0)
+      {
         _sequence[i] = DEFAULT_NOTE;
         added = true;
         continue;
       }
-
+      else if (velocity == 0 && _sequence[i].velocity == 0)
+      {
+        _sequence[i] = DEFAULT_NOTE;
+        added = true;
+        continue;
+      }
     }
 
     // use the free slot
-    if(_sequence[i].pitch == 0 && _sequence[i].step == 0 && _sequence[i].channel == 0 && !added)
+    if (_sequence[i].pitch == 0 && _sequence[i].step == 0 && _sequence[i].channel == 0 && !added)
     {
 
       _sequence[i].channel = channel;
@@ -412,13 +489,10 @@ void FifteenStep::setNote(byte channel, byte pitch, byte velocity, byte step)
       _sequence[i].step = position;
 
       added = true;
-
     }
-
   }
 
   _heapSort();
-
 }
 
 // pause
@@ -441,10 +515,28 @@ void FifteenStep::pause()
 // @access public
 // @return void
 //
-void FifteenStep::start()
+void FifteenStep::start(int position)
 {
-  _position = 0;
+  _position = position;
   _running = true;
+
+  if (_hw_timer_mode)
+  {
+    // Reset the pulse counter so the hardware timer counts a full sixteenth
+    // note before triggering step 1. Set pending flags so step 0 and the
+    // first clock fire on the very next run() call (the firmware also resets
+    // the TC4 counter via resetSequencerTimerSync() to keep clock regular).
+    _hw_pulse_count = 0;
+    _hw_step_pending = true;
+    _hw_clock_pending = true;
+  }
+  else
+  {
+    // Software mode: seed timers to now so the drift-free += scheduling
+    // starts from a correct baseline.
+    _next_beat = micros();
+    _next_clock = micros();
+  }
 }
 
 // stop
@@ -457,6 +549,7 @@ void FifteenStep::start()
 void FifteenStep::stop()
 {
   _running = false;
+  // _resetSequence();
 }
 
 // panic
@@ -469,16 +562,49 @@ void FifteenStep::stop()
 void FifteenStep::panic()
 {
 
-  for(int i=0; i < 16; ++i)
+  for (int i = 0; i < 16; ++i)
   {
     // send all notes off for each channel if callback is set
-    if(_midi_cb)
+    if (_midi_cb)
       _midi_cb(i, 0x7B, 0x0, 0x0);
   }
 
   // clear notes
   _resetSequence();
+}
 
+// setHardwareTimerMode
+//
+// Switches between software polling (micros) and hardware timer flag mode.
+// Call with true after setting up the TC4 hardware timer in the firmware.
+//
+// @access public
+// @param enabled true = use ISR flags, false = use micros() polling
+// @return void
+//
+void FifteenStep::setHardwareTimerMode(bool enabled)
+{
+  _hw_timer_mode = enabled;
+}
+
+// hardwareClockPulse
+//
+// Called from the TC4 hardware timer ISR on every MIDI clock tick.
+// MUST be ISR-safe: only touches volatile flags, no malloc, no USB.
+// Every 6 pulses (= one 16th note at 24 PPQN) a step is also flagged.
+//
+// @access public
+// @return void
+//
+void FifteenStep::hardwareClockPulse()
+{
+  _hw_clock_pending = true;
+  _hw_pulse_count++;
+  if (_hw_pulse_count >= 6)
+  {
+    _hw_pulse_count = 0;
+    _hw_step_pending = true;
+  }
 }
 
 // getSequence
@@ -488,7 +614,7 @@ void FifteenStep::panic()
 // @access private
 // @return FifteenStepNote*
 //
-FifteenStepNote* FifteenStep::getSequence()
+FifteenStepNote *FifteenStep::getSequence()
 {
   return _sequence;
 }
@@ -533,12 +659,15 @@ void FifteenStep::_init(int memory)
   _next_clock = 0;
   _position = 0;
   _shuffle = 0;
+  _hw_timer_mode = false;
+  _hw_step_pending = false;
+  _hw_clock_pending = false;
+  _hw_pulse_count = 0;
   _sequence_size = memory / sizeof(FifteenStepNote);
   _sequence = new FifteenStepNote[_sequence_size];
 
   // set up default notes
   _resetSequence();
-
 }
 
 // _shuffleDivision
@@ -552,9 +681,10 @@ void FifteenStep::_init(int memory)
 //
 unsigned long FifteenStep::_shuffleDivision()
 {
-  // split the 16th into 16 parts
+  // split the 16th into 6 parts
   // so user can change the shuffle
-  return _sixteenth / 16;
+  // based on midi clock
+  return _sixteenth / 6;
 }
 
 // _resetSequence
@@ -566,7 +696,7 @@ unsigned long FifteenStep::_shuffleDivision()
 void FifteenStep::_resetSequence()
 {
   // set sequence to default note value
-  for(int i=0; i < _sequence_size; ++i)
+  for (int i = 0; i < _sequence_size; ++i)
     _sequence[i] = DEFAULT_NOTE;
 }
 
@@ -582,7 +712,7 @@ void FifteenStep::_resetSequence()
 int FifteenStep::_quantizedPosition()
 {
 
-  if(_shuffle > 0)
+  if (_shuffle > 0)
     return _position;
 
   // what's the time?
@@ -592,17 +722,16 @@ int FifteenStep::_quantizedPosition()
   unsigned long thirty_second = _sixteenth / 2;
 
   // use current position if below middle point
-  if(now <= (_next_beat - thirty_second))
+  if (now <= (_next_beat - thirty_second))
     return _position;
 
   // return first step if the next step
   // is past the step count
-  if((_position + 1) >= _steps)
+  if ((_position + 1) >= _steps)
     return 0;
 
   // return next step
   return _position + 1;
-
 }
 
 // _step
@@ -624,17 +753,16 @@ void FifteenStep::_step()
   _position++;
 
   // start over if we've reached the end
-  if(_position >= _steps)
+  if (_position >= _steps)
     _position = 0;
 
   // tell the callback where we are
   // if it has been set by the sketch
-  if(_step_cb)
+  if (_step_cb)
     _step_cb(_position, last);
 
   // trigger next set of notes
   _triggerNotes();
-
 }
 
 // _tick
@@ -649,12 +777,14 @@ void FifteenStep::_tick()
 {
 
   // bail if the midi callback isn't set
-  if(! _midi_cb)
+  if (!_midi_cb)
     return;
 
-  // tick
-  _midi_cb(0x0, 0xF8, 0x0, 0x0);
+  // Serial.print("_tick in MIDIUSB.cpp : ");
+  // Serial.println(millis());
 
+  // tick
+  _midi_cb(0xFF, 0xF8, 0x0, 0x0);
 }
 
 // _loopPosition
@@ -669,12 +799,11 @@ void FifteenStep::_loopPosition()
 {
 
   // bail if the midi callback isn't set
-  if(! _midi_cb)
+  if (!_midi_cb)
     return;
 
   // send position
   _midi_cb(0x0, 0xF2, 0x0, _position);
-
 }
 
 // _heapSort
@@ -692,10 +821,10 @@ void FifteenStep::_heapSort()
   int i;
   FifteenStepNote tmp;
 
-  for(i = _sequence_size / 2; i >= 0; i--)
+  for (i = _sequence_size / 2; i >= 0; i--)
     _siftDown(i, _sequence_size - 1);
 
-  for(i = _sequence_size - 1; i >= 1; i--)
+  for (i = _sequence_size - 1; i >= 1; i--)
   {
 
     tmp = _sequence[0];
@@ -703,9 +832,7 @@ void FifteenStep::_heapSort()
     _sequence[i] = tmp;
 
     _siftDown(0, i - 1);
-
   }
-
 }
 
 // _siftDown
@@ -722,12 +849,12 @@ void FifteenStep::_siftDown(int root, int bottom)
 
   int max = root * 2 + 1;
 
-  if(max < bottom)
+  if (max < bottom)
     max = _greater(max, max + 1) == max ? max : max + 1;
-  else if(max > bottom)
+  else if (max > bottom)
     return;
 
-  if(_greater(root, max) == root || _greater(root, max) == -1)
+  if (_greater(root, max) == root || _greater(root, max) == -1)
     return;
 
   FifteenStepNote tmp = _sequence[root];
@@ -735,7 +862,6 @@ void FifteenStep::_siftDown(int root, int bottom)
   _sequence[max] = tmp;
 
   _siftDown(max, bottom);
-
 }
 
 // _greater
@@ -752,28 +878,27 @@ void FifteenStep::_siftDown(int root, int bottom)
 int FifteenStep::_greater(int first, int second)
 {
 
-  if(_sequence[first].velocity > _sequence[second].velocity)
+  if (_sequence[first].velocity > _sequence[second].velocity)
     return first;
-  else if(_sequence[second].velocity > _sequence[first].velocity)
+  else if (_sequence[second].velocity > _sequence[first].velocity)
     return second;
 
-  if(_sequence[first].pitch > _sequence[second].pitch)
+  if (_sequence[first].pitch > _sequence[second].pitch)
     return first;
-  else if(_sequence[second].pitch > _sequence[first].pitch)
+  else if (_sequence[second].pitch > _sequence[first].pitch)
     return second;
 
-  if(_sequence[first].step > _sequence[second].step)
+  if (_sequence[first].step > _sequence[second].step)
     return first;
-  else if(_sequence[second].step > _sequence[first].step)
+  else if (_sequence[second].step > _sequence[first].step)
     return second;
 
-  if(_sequence[first].channel > _sequence[second].channel)
+  if (_sequence[first].channel > _sequence[second].channel)
     return first;
-  else if(_sequence[second].channel > _sequence[first].channel)
+  else if (_sequence[second].channel > _sequence[first].channel)
     return second;
 
-  return - 1;
-
+  return -1;
 }
 
 // _triggerNotes
@@ -789,29 +914,26 @@ void FifteenStep::_triggerNotes()
 {
 
   // bail if the midi callback isn't set
-  if(! _midi_cb)
+  if (!_midi_cb)
     return;
 
   // loop through the sequence again and trigger note ons at the current position
-  for(int i=0; i < _sequence_size; ++i)
+  for (int i = 0; i < _sequence_size; ++i)
   {
 
     // ignore if it's not the current position
-    if(_sequence[i].step != _position)
+    if (_sequence[i].step != _position)
       continue;
 
     // if this position is in the default state, ignore it
-    if(_sequence[i].pitch == 0 && _sequence[i].velocity == 0 && _sequence[i].step == 0)
+    if (_sequence[i].pitch == 0 && _sequence[i].velocity == 0 && _sequence[i].step == 0)
       continue;
 
     // send note on values to callback
     _midi_cb(
-      _sequence[i].channel,
-      _sequence[i].velocity > 0 ? 0x9 : 0x8,
-      _sequence[i].pitch,
-      _sequence[i].velocity
-    );
-
+        _sequence[i].channel,
+        _sequence[i].velocity > 0 ? 0x9 : 0x8,
+        _sequence[i].pitch,
+        _sequence[i].velocity);
   }
-
 }
